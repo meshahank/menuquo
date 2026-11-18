@@ -1,15 +1,13 @@
 # Menuquo
 
-Menuquo is a simple QR-menu experience for restaurants.
+Menuquo is a QR menu platform for restaurants powered by React, Vite, Supabase, and Google OAuth.
 
-## Live site
+## Deployed Site
 
 https://menuquo.vercel.app
 
-## Source
+## Tech Stack
 
-The static site is in `dist/`:
-
-- `index.html`
-- `styles.css`
-- `app.js`
+- **Frontend**: React, Vite, Tailwind CSS
+- **Backend**: Supabase (PostgreSQL, Row Level Security)
+- **Auth**: Google OAuth via Supabase Auth
