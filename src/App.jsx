@@ -46,34 +46,34 @@ let ownerLoadPromise = null
 const loadOwnerData = async () => {
   if (ownerLoadPromise) return ownerLoadPromise
   ownerLoadPromise = (async () => {
-    if (!user) return
+    if (!user) return false
     const { data: restaurants } = await supabase
       .from('restaurants')
       .select('*')
       .eq('owner', user.id)
       .limit(1)
-    let r = restaurants?.[0]
-    if (!r) r = await createDefaultRestaurant()
-    if (!r) return
-  state.restaurant = {
-    id: r.id,
-    name: r.name,
-    slug: r.slug,
-    currency: r.currency,
-    hero: r.hero_image || '',
-  }
-  const [{ data: cats }, { data: items }] = await Promise.all([
-    supabase.from('categories').select('*').eq('restaurant_id', r.id).order('position'),
-    supabase.from('menu_items').select('*').eq('restaurant_id', r.id).order('position'),
-  ])
-  state.menu = (cats || []).map((c) => ({
-    id: c.id,
-    name: c.name,
-    items: (items || []).filter((i) => i.category_id === c.id),
-  }))
-  publicData = null
-  publicSlug = null
-  publicLoading = false
+    const r = restaurants?.[0]
+    if (!r) return false
+    state.restaurant = {
+      id: r.id,
+      name: r.name,
+      slug: r.slug,
+      currency: r.currency,
+      hero: r.hero_image || '',
+    }
+    const [{ data: cats }, { data: items }] = await Promise.all([
+      supabase.from('categories').select('*').eq('restaurant_id', r.id).order('position'),
+      supabase.from('menu_items').select('*').eq('restaurant_id', r.id).order('position'),
+    ])
+    state.menu = (cats || []).map((c) => ({
+      id: c.id,
+      name: c.name,
+      items: (items || []).filter((i) => i.category_id === c.id),
+    }))
+    publicData = null
+    publicSlug = null
+    publicLoading = false
+    return true
   })()
   try {
     return await ownerLoadPromise
@@ -82,29 +82,31 @@ const loadOwnerData = async () => {
   }
 }
 
-const createDefaultRestaurant = async () => {
-  const name = user.user_metadata?.name || user.email?.split('@')[0] || 'My Restaurant'
-  const base =
-    name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'my-restaurant'
-  const slug = base + '-' + Math.random().toString(36).slice(2, 6)
+const slugify = (s) =>
+  String(s).trim().toLowerCase().replace(/['’]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+
+// Creates the restaurant from the onboarding form answers
+const createRestaurant = async (fields) => {
   const { data, error } = await supabase
     .from('restaurants')
-    .insert({ owner: user.id, name, slug, currency: '₹' })
+    .insert({ owner: user.id, ...fields })
     .select()
     .single()
-  if (error) {
-    toast('Could not create your restaurant: ' + error.message)
-    return null
-  }
+  if (error) return { error }
   await supabase.from('categories').insert([
     { restaurant_id: data.id, name: 'Starters', position: 0 },
     { restaurant_id: data.id, name: 'Mains', position: 1 },
   ])
-  return data
+  return { data }
 }
 
-const ensurePublicData = async () => {
-  const slug = view.split('/')[1]
+// Public menu lives on a real path: /menu/<slug> ('' = show the first restaurant)
+const pathMenuSlug = () => {
+  const m = location.pathname.match(/^\/menu(?:\/([^/]+))?\/?$/i)
+  return m ? decodeURIComponent(m[1] || '') : null
+}
+
+const ensurePublicData = async (slug) => {
   if (publicLoading || (publicSlug === slug && publicData)) return
   publicSlug = slug
   publicLoading = true
@@ -144,17 +146,22 @@ const render = () => {
   if (!app) return
 
   let content
-  if (view.startsWith('dashboard') && !user) {
+  const menuSlug = pathMenuSlug()
+  if (menuSlug !== null) {
+    // Guest-facing menu page: a real path (/menu/<id>), not a hash route
+    if (supabaseReady) ensurePublicData(menuSlug)
+    content = PublicMenu()
+  } else if (view.startsWith('dashboard') && !user) {
     content = Login()
+  } else if (view.startsWith('dashboard')) {
+    // A signed-in user with no restaurant yet goes through onboarding
+    content = state.restaurant.id ? Dashboard() : Onboarding()
+  } else if (view === 'onboarding') {
+    content = Onboarding()
+  } else if (view === 'login') {
+    content = user ? (state.restaurant.id ? Dashboard() : Onboarding()) : Login()
   } else if (view === 'landing' || view === 'sales') {
     content = Landing()
-  } else if (view === 'login') {
-    content = user ? Dashboard() : Login()
-  } else if (view.startsWith('dashboard')) {
-    content = Dashboard()
-  } else if (view.startsWith('public')) {
-    content = PublicMenu()
-    if (supabaseReady) ensurePublicData()
   } else {
     content = Landing()
   }
@@ -193,6 +200,40 @@ const bind = () => {
       state = JSON.parse(JSON.stringify(EMPTY))
       go('landing')
     }
+  const onboarding = $('#onboarding-form')
+  if (onboarding) {
+    const nameInput = onboarding.querySelector('[name=name]')
+    const slugInput = onboarding.querySelector('[name=slug]')
+    let slugTouched = false
+    slugInput.addEventListener('input', () => { slugTouched = true })
+    nameInput.addEventListener('input', () => {
+      if (!slugTouched) slugInput.value = slugify(nameInput.value)
+    })
+    onboarding.onsubmit = async (e) => {
+      e.preventDefault()
+      const d = new FormData(onboarding)
+      const submitBtn = onboarding.querySelector('button')
+      submitBtn.disabled = true
+      const { error } = await createRestaurant({
+        name: d.get('name'),
+        slug: slugify(d.get('slug')),
+        currency: d.get('currency'),
+        hero_image: d.get('hero') || null,
+      })
+      submitBtn.disabled = false
+      if (error) {
+        toast(
+          error.code === '23505'
+            ? 'That menu ID is already taken — try another.'
+            : 'Could not create restaurant: ' + error.message
+        )
+        return
+      }
+      toast('Restaurant created')
+      await loadOwnerData()
+      go('dashboard/overview')
+    }
+  }
   const settings = $('#settings-form')
   if (settings)
     settings.onsubmit = async (e) => {
@@ -202,8 +243,9 @@ const bind = () => {
         .from('restaurants')
         .update({
           name: d.get('name'),
-          slug: d.get('slug').trim().replace(/\s+/g, '-').toLowerCase(),
+          slug: slugify(d.get('slug')),
           currency: d.get('currency'),
+          hero_image: d.get('hero') || null,
         })
         .eq('id', state.restaurant.id)
       if (error) {
@@ -286,7 +328,7 @@ const Landing = () => `
         </p>
         <div class="hero-actions">
           <button class="btn dark" data-go="login">Create your menu →</button>
-          <button class="btn ghost" data-go="public">See a live menu</button>
+          <a class="btn ghost" href="/menu">See a live menu</a>
         </div>
       </section>
       <section class="product-shot">
@@ -380,7 +422,7 @@ const Landing = () => `
 const Login = () => `
   <main class="auth-wrap">
     <section class="auth">
-      <a class="brand" href="#landing">
+      <a class="brand" href="/">
         <span class="brand-mark">m</span>menuquo
       </a>
       <h1>Welcome back.</h1>
@@ -389,6 +431,38 @@ const Login = () => `
         Continue with Google →
       </button>
       <p class="hint">Your Google account is how you claim your restaurant.</p>
+    </section>
+  </main>
+`
+
+const Onboarding = () => `
+  <main class="auth-wrap">
+    <section class="auth">
+      <a class="brand" href="/">
+        <span class="brand-mark">m</span>menuquo
+      </a>
+      <h1>Set up your restaurant.</h1>
+      <p>One quick step — these details create your public menu page.</p>
+      <form id="onboarding-form">
+        <label class="field">Restaurant name
+          <input name="name" required placeholder="Saffron Table" />
+        </label>
+        <label class="field">Menu ID
+          <input name="slug" required placeholder="saffron-table" />
+          <small style="color:var(--muted)">Guests see your menu at /menu/&lt;menu-id&gt; — lowercase letters, numbers and dashes.</small>
+        </label>
+        <label class="field">Currency
+          <select name="currency">
+            <option>₹</option>
+            <option>$</option>
+            <option>£</option>
+          </select>
+        </label>
+        <label class="field">Hero image URL (optional)
+          <input name="hero" type="url" placeholder="https://..." />
+        </label>
+        <button class="btn dark" style="width:100%;justify-content:center">Create my menu →</button>
+      </form>
     </section>
   </main>
 `
@@ -450,7 +524,7 @@ const Overview = () => `
     <article class="stat-card">
       <small>Restaurant</small>
       <strong style="font-size:22px">${state.restaurant.name}</strong>
-      <span class="up">Public link: #public/${state.restaurant.slug || ''}</span>
+      <span class="up">Public link: /menu/${state.restaurant.slug || ''}</span>
     </article>
     <article class="stat-card">
       <small>Live menu items</small>
@@ -549,7 +623,7 @@ const Editor = () => {
 }
 
 const QRCode = () => {
-  const url = `${location.origin}${location.pathname}#public/${state.restaurant.slug || ''}`
+  const url = `${location.origin}/menu/${state.restaurant.slug || ''}`
   const img = `https://api.qrserver.com/v1/create-qr-code/?size=420x420&data=${encodeURIComponent(url)}`
   return `
     <div class="qr-layout">
@@ -582,8 +656,9 @@ const Settings = () => `
       <label class="field">Restaurant name
         <input name="name" value="${state.restaurant.name}" required />
       </label>
-      <label class="field">Public slug
+      <label class="field">Menu ID
         <input name="slug" value="${state.restaurant.slug}" required />
+        <small style="color:var(--muted)">Your public menu lives at /menu/&lt;menu-id&gt;</small>
       </label>
       <label class="field">Currency
         <select name="currency">
@@ -591,6 +666,9 @@ const Settings = () => `
           <option>$</option>
           <option>£</option>
         </select>
+      </label>
+      <label class="field">Hero image URL
+        <input name="hero" type="url" value="${state.restaurant.hero}" placeholder="https://..." />
       </label>
       <button class="btn">Save changes</button>
     </form>
@@ -623,12 +701,12 @@ const PublicMenu = () => {
     <main class="preview-page">
       <section class="public-menu">
         <header class="public-top">
-          <a class="public-brand" href="#landing">
+          <a class="public-brand" href="/">
             <span class="brand-mark">m</span> menuquo
           </a>
-          <button class="btn ghost" data-go="${user ? 'dashboard/overview' : 'login'}">
+          <a class="btn ghost" href="/${user ? '#dashboard/overview' : '#login'}">
             ${user ? 'Owner view' : 'Own your menu'}
-          </button>
+          </a>
         </header>
         <section class="menu-hero">
           <img
@@ -680,7 +758,12 @@ const PublicMenu = () => {
 // Main App component - manages routing via hash and the Supabase session
 const App = () => {
   useEffect(() => {
-    const onHash = () => {
+    const onRoute = () => {
+      if (pathMenuSlug() !== null) {
+        // Public menu path — render it regardless of the hash
+        render()
+        return
+      }
       view = location.hash.slice(1) || (user ? 'dashboard/overview' : 'landing')
       render()
     }
@@ -694,8 +777,13 @@ const App = () => {
     const boot = async () => {
       const { data: { session } } = await supabase.auth.getSession()
       user = session?.user || null
-      if (user) await loadOwnerData()
-      view = location.hash.slice(1) || (user ? 'dashboard/overview' : 'landing')
+      let hasRestaurant = false
+      if (user) hasRestaurant = await loadOwnerData()
+      if (user && !hasRestaurant) {
+        view = 'onboarding'
+      } else {
+        view = location.hash.slice(1) || (user ? 'dashboard/overview' : 'landing')
+      }
       render()
       bootDone = true
     }
@@ -711,16 +799,21 @@ const App = () => {
         // Boot may have already loaded this session — don't load twice
         if (!bootDone) return
         user = session.user
-        loadOwnerData().then(() => render())
+        loadOwnerData().then((hasRestaurant) => {
+          if (!hasRestaurant) view = 'onboarding'
+          render()
+        })
       } else if (event === 'USER_UPDATED' && session) {
         user = session.user
       }
     })
 
-    window.addEventListener('hashchange', onHash)
+    window.addEventListener('hashchange', onRoute)
+    window.addEventListener('popstate', onRoute)
     return () => {
       subscription.unsubscribe()
-      window.removeEventListener('hashchange', onHash)
+      window.removeEventListener('hashchange', onRoute)
+      window.removeEventListener('popstate', onRoute)
     }
   }, [])
 
