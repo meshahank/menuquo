@@ -1,0 +1,9 @@
+node_modules/
+dist/assets/
+*.log
+*.err
+FINAL_SUMMARY.txt
+file_list.txt
+tree.txt
+.env
+.env.*

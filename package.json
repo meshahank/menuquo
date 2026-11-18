@@ -1,0 +1,27 @@
+{
+  "name": "menuquo",
+  "version": "1.0.0",
+  "description": "Menuquo is a simple QR-menu experience for restaurants.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meshahank/menuquo.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/meshahank/menuquo/issues"
+  },
+  "homepage": "https://github.com/meshahank/menuquo#readme",
+  "dependencies": {
+    "@vitejs/plugin-react": "^6.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "vite": "^8.3.7"
+  }
+}
