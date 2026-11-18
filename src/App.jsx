@@ -1,70 +1,25 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect } from 'react'
 import './index.css'
+import { supabase, supabaseReady } from './lib/supabase'
 
 // jQuery-like helper
 const $ = (s) => document.querySelector(s)
 
-const initial = {
-  restaurant: {
-    name: 'Saffron Table',
-    slug: 'saffron-table',
-    currency: '₹',
-    hero: 'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?auto=format&fit=crop&w=1200&q=85',
-  },
-  scanCount: 128,
-  today: 24,
-  menu: [
-    {
-      name: 'Small Plates',
-      items: [
-        {
-          name: 'Crispy Corn Chaat',
-          description: 'Sweet corn, lime, chilli, coriander',
-          price: '220',
-          tag: 'crowd favourite',
-          image:
-            'https://images.unsplash.com/photo-1601050690597-df0568f70950?auto=format&fit=crop&w=300&q=80',
-          available: true,
-        },
-        {
-          name: 'Charred Paneer',
-          description: 'Smoky paneer, mint yoghurt',
-          price: '310',
-          tag: 'vegetarian',
-          image:
-            'https://images.unsplash.com/photo-1567188040759-fb8a883dc6d8?auto=format&fit=crop&w=300&q=80',
-          available: true,
-        },
-      ],
-    },
-    {
-      name: 'Mains',
-      items: [
-        {
-          name: 'Butter Chicken',
-          description: 'Tomato, kasuri methi, cream',
-          price: '420',
-          tag: 'house favourite',
-          image:
-            'https://images.unsplash.com/photo-1603894584373-5ac82b2ae398?auto=format&fit=crop&w=300&q=80',
-          available: true,
-        },
-        {
-          name: 'Vegetable Biryani',
-          description: 'Aromatic basmati, seasonal vegetables',
-          price: '360',
-          tag: 'seasonal',
-          image:
-            'https://images.unsplash.com/photo-1589302168068-964664d93dc0?auto=format&fit=crop&w=300&q=80',
-          available: false,
-        },
-      ],
-    },
-  ],
-}
+// Signed-in user (null when logged out)
+let user = null
+let bootDone = false
 
-let state = JSON.parse(localStorage.getItem('menuquo-demo')) || JSON.parse(JSON.stringify(initial))
-let view = location.hash.slice(1) || 'landing'
+// Owner workspace state (loaded from Supabase once signed in)
+const EMPTY = {
+  restaurant: { id: null, name: 'My Restaurant', slug: '', currency: '₹', hero: '' },
+  menu: [],
+}
+let state = JSON.parse(JSON.stringify(EMPTY))
+
+// Public menu state (fetched per slug)
+let publicData = null
+let publicSlug = null
+let publicLoading = false
 
 const go = (v) => {
   location.hash = v
@@ -78,25 +33,128 @@ const toast = (t) => {
   e.className = 'toast'
   e.textContent = t
   document.body.append(e)
-  setTimeout(() => e.remove(), 2200)
+  setTimeout(() => e.remove(), 2600)
 }
 
-const money = (x) =>
-  state.restaurant.currency + Number(x).toLocaleString('en-IN')
+const money = (x) => state.restaurant.currency + Number(x).toLocaleString('en-IN')
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
+
+let ownerLoadPromise = null
+const loadOwnerData = async () => {
+  if (ownerLoadPromise) return ownerLoadPromise
+  ownerLoadPromise = (async () => {
+    if (!user) return
+    const { data: restaurants } = await supabase
+      .from('restaurants')
+      .select('*')
+      .eq('owner', user.id)
+      .limit(1)
+    let r = restaurants?.[0]
+    if (!r) r = await createDefaultRestaurant()
+    if (!r) return
+  state.restaurant = {
+    id: r.id,
+    name: r.name,
+    slug: r.slug,
+    currency: r.currency,
+    hero: r.hero_image || '',
+  }
+  const [{ data: cats }, { data: items }] = await Promise.all([
+    supabase.from('categories').select('*').eq('restaurant_id', r.id).order('position'),
+    supabase.from('menu_items').select('*').eq('restaurant_id', r.id).order('position'),
+  ])
+  state.menu = (cats || []).map((c) => ({
+    id: c.id,
+    name: c.name,
+    items: (items || []).filter((i) => i.category_id === c.id),
+  }))
+  publicData = null
+  publicSlug = null
+  publicLoading = false
+  })()
+  try {
+    return await ownerLoadPromise
+  } finally {
+    ownerLoadPromise = null
+  }
+}
+
+const createDefaultRestaurant = async () => {
+  const name = user.user_metadata?.name || user.email?.split('@')[0] || 'My Restaurant'
+  const base =
+    name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'my-restaurant'
+  const slug = base + '-' + Math.random().toString(36).slice(2, 6)
+  const { data, error } = await supabase
+    .from('restaurants')
+    .insert({ owner: user.id, name, slug, currency: '₹' })
+    .select()
+    .single()
+  if (error) {
+    toast('Could not create your restaurant: ' + error.message)
+    return null
+  }
+  await supabase.from('categories').insert([
+    { restaurant_id: data.id, name: 'Starters', position: 0 },
+    { restaurant_id: data.id, name: 'Mains', position: 1 },
+  ])
+  return data
+}
+
+const ensurePublicData = async () => {
+  const slug = view.split('/')[1]
+  if (publicLoading || (publicSlug === slug && publicData)) return
+  publicSlug = slug
+  publicLoading = true
+  publicData = null
+  render()
+  let query = supabase.from('restaurants').select('*').limit(1)
+  if (slug) query = query.eq('slug', slug)
+  const { data: rs } = await query
+  const r = rs?.[0]
+  if (r) {
+    const [{ data: cats }, { data: items }] = await Promise.all([
+      supabase.from('categories').select('*').eq('restaurant_id', r.id).order('position'),
+      supabase.from('menu_items').select('*').eq('restaurant_id', r.id).order('position'),
+    ])
+    publicData = {
+      restaurant: r,
+      menu: (cats || []).map((c) => ({
+        name: c.name,
+        items: (items || []).filter((i) => i.category_id === c.id),
+      })),
+    }
+  } else {
+    publicData = { notFound: true }
+  }
+  publicLoading = false
+  render()
+}
+
+// ---------------------------------------------------------------------------
+// Routing / rendering
+// ---------------------------------------------------------------------------
+
+let view = location.hash.slice(1) || 'landing'
 
 const render = () => {
   const app = $('#root')
   if (!app) return
 
   let content
-  if (view === 'landing' || view === 'sales') {
+  if (view.startsWith('dashboard') && !user) {
+    content = Login()
+  } else if (view === 'landing' || view === 'sales') {
     content = Landing()
   } else if (view === 'login') {
-    content = Login()
+    content = user ? Dashboard() : Login()
   } else if (view.startsWith('dashboard')) {
     content = Dashboard()
-  } else if (view === 'public') {
+  } else if (view.startsWith('public')) {
     content = PublicMenu()
+    if (supabaseReady) ensurePublicData()
   } else {
     content = Landing()
   }
@@ -105,7 +163,7 @@ const render = () => {
 }
 
 const bind = () => {
-  document.querySelectorAll('[data-go]').forEach ((e) => {
+  document.querySelectorAll('[data-go]').forEach((e) => {
     e.onclick = () => go(e.dataset.go)
   })
   document.querySelectorAll('[data-copy]').forEach((e) => {
@@ -118,70 +176,93 @@ const bind = () => {
       }
     }
   })
-  const login = $('#login-form')
-  if (login) login.onsubmit = (e) => {
-    e.preventDefault()
-    go('dashboard/overview')
-  }
+  const google = $('#google-signin')
+  if (google)
+    google.onclick = async () => {
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: { redirectTo: location.origin + location.pathname },
+      })
+      if (error) toast('Sign-in failed: ' + error.message)
+    }
+  const signout = $('#signout')
+  if (signout)
+    signout.onclick = async () => {
+      await supabase.auth.signOut()
+      user = null
+      state = JSON.parse(JSON.stringify(EMPTY))
+      go('landing')
+    }
   const settings = $('#settings-form')
-  if (settings) settings.onsubmit = (e) => {
-    e.preventDefault()
-    const d = new FormData(settings)
-    setState({
-      ...state,
-      restaurant: {
-        ...state.restaurant,
-        name: d.get('name'),
-        slug: d.get('slug').replace(/\s+/g, '-'),
-        currency: d.get('currency'),
-      },
-    })
-    toast('Restaurant settings saved')
-  }
+  if (settings)
+    settings.onsubmit = async (e) => {
+      e.preventDefault()
+      const d = new FormData(settings)
+      const { error } = await supabase
+        .from('restaurants')
+        .update({
+          name: d.get('name'),
+          slug: d.get('slug').trim().replace(/\s+/g, '-').toLowerCase(),
+          currency: d.get('currency'),
+        })
+        .eq('id', state.restaurant.id)
+      if (error) {
+        toast('Save failed: ' + error.message)
+        return
+      }
+      toast('Restaurant settings saved')
+      await loadOwnerData()
+      render()
+    }
   const add = $('#add-item-form')
-  if (add) add.onsubmit = (e) => {
-    e.preventDefault()
-    const d = new FormData(add)
-    setState((prev) => ({
-      ...prev,
-      menu: prev.menu.map((c, ci) => {
-        if (ci === +d.get('category')) {
-          return {
-            ...c,
-            items: [...c.items, {
-              name: d.get('name'),
-              price: d.get('price'),
-              description: d.get('description'),
-              image: d.get('image'),
-              available: true,
-            }],
-          }
-        }
-        return c
-      }),
-    }))
-    toast('Menu item added')
-  }
+  if (add)
+    add.onsubmit = async (e) => {
+      e.preventDefault()
+      const d = new FormData(add)
+      const { error } = await supabase
+        .from('menu_items')
+        .insert({
+          restaurant_id: state.restaurant.id,
+          category_id: d.get('category'),
+          name: d.get('name'),
+          price: d.get('price') || 0,
+          description: d.get('description'),
+          image_url: d.get('image') || null,
+          available: true,
+        })
+      if (error) {
+        toast('Could not add item: ' + error.message)
+        return
+      }
+      toast('Menu item added')
+      await loadOwnerData()
+      render()
+    }
   const newItem = $('#new-item')
   if (newItem) newItem.onclick = () => $('#item-form').classList.remove('hide')
   const close = $('#close-item')
   if (close) close.onclick = () => $('#item-form').classList.add('hide')
   document.querySelectorAll('[data-toggle]').forEach((b) => {
-    b.onclick = () => {
-      const [c, i] = b.dataset.toggle.split('-')
-      state.menu[c].items[i].available = !state.menu[c].items[i].available
-      localStorage.setItem('menuquo-demo', JSON.stringify(state))
+    b.onclick = async () => {
+      const item = state.menu.flatMap((c) => c.items).find((i) => i.id === b.dataset.toggle)
+      if (!item) return
+      const { error } = await supabase
+        .from('menu_items')
+        .update({ available: !item.available })
+        .eq('id', item.id)
+      if (error) {
+        toast('Update failed: ' + error.message)
+        return
+      }
+      await loadOwnerData()
       render()
     }
   })
-  // Handle hashchange
-  window.addEventListener('hashchange', () => {
-    view = location.hash.slice(1) || 'landing'
-    render()
-  })
 }
 
-// Page components that return HTML strings
+// ---------------------------------------------------------------------------
+// Page components
+// ---------------------------------------------------------------------------
 
 const Landing = () => `
   <div class="shell">
@@ -304,16 +385,10 @@ const Login = () => `
       </a>
       <h1>Welcome back.</h1>
       <p>Sign in to manage your digital menu.</p>
-      <form id="login-form">
-        <label class="field">Email
-          <input type="email" required value="owner@saffrontable.com" />
-        </label>
-        <label class="field">Password
-          <input type="password" required value="menuquo" />
-        </label>
-        <button class="btn dark">Continue to dashboard →</button>
-      </form>
-      <p class="hint">Demo mode — any email and password works.</p>
+      <button class="btn dark" id="google-signin" style="width:100%;justify-content:center">
+        Continue with Google →
+      </button>
+      <p class="hint">Your Google account is how you claim your restaurant.</p>
     </section>
   </main>
 `
@@ -337,6 +412,8 @@ const Nav = (activePage) => `
         .join('')}
     </nav>
     <div class="sidebar-foot">
+      ${user ? `<small style="display:block;margin-bottom:8px;color:var(--muted)">${user.email || ''}</small>` : ''}
+      ${user ? `<button class="btn ghost" id="signout">Sign out</button>` : ''}
       <button class="btn ghost" data-go="landing">← Back to site</button>
     </div>
   </aside>
@@ -371,21 +448,19 @@ const Overview = () => `
   </section>
   <section class="stat-grid">
     <article class="stat-card">
-      <small>Total menu scans</small>
-      <strong>${state.scanCount}</strong>
-      <span class="up">↑ 18% this week</span>
-    </article>
-    <article class="stat-card">
-      <small>Scans today</small>
-      <strong>${state.today}</strong>
-      <span class="up">↑ 6 since yesterday</span>
+      <small>Restaurant</small>
+      <strong style="font-size:22px">${state.restaurant.name}</strong>
+      <span class="up">Public link: #public/${state.restaurant.slug || ''}</span>
     </article>
     <article class="stat-card">
       <small>Live menu items</small>
-      <strong>
-        ${state.menu.reduce((n, c) => n + c.items.length, 0)}
-      </strong>
+      <strong>${state.menu.reduce((n, c) => n + c.items.length, 0)}</strong>
       <span class="up">All published</span>
+    </article>
+    <article class="stat-card">
+      <small>Categories</small>
+      <strong>${state.menu.length}</strong>
+      <span class="up">On your menu</span>
     </article>
   </section>
   <section class="panel">
@@ -423,29 +498,31 @@ const Editor = () => {
       </div>
       <button class="btn" id="new-item">+ Add menu item</button>
     </div>
-    ${state.menu.map((c, ci) =>
+    ${state.menu.length === 0
+      ? `<section class="panel"><p style="color:var(--muted)">No categories yet.</p></section>`
+      : state.menu.map((c) =>
       `<section class="category">
         <div class="category-head">
           <h3>${c.name}</h3>
           <small>${c.items.length} items</small>
         </div>
-        ${c.items.map((x, ii) => {
+        ${c.items.map((x) => {
           const availClass = x.available ? '' : 'sold'
           return `
           <div class="menu-item">
             <img class="menu-thumb"
-              src="${x.image || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=200&q=70'}"
+              src="${x.image_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=200&q=70'}"
               alt=""
             />
             <div>
               <b>${x.name}</b>
-              <small>${x.description}</small>
+              <small>${x.description || ''}</small>
             </div>
             <b>${money(x.price)}</b>
             <span class="available ${availClass}">
               ${x.available ? 'Available' : 'Sold out'}
             </span>
-            <button class="icon-btn" data-toggle="${ci}-${ii}">↻</button>
+            <button class="icon-btn" data-toggle="${x.id}">↻</button>
           </div>`
         }).join('')}
       </section>`
@@ -458,7 +535,7 @@ const Editor = () => {
       <form id="add-item-form">
         <div class="editor-row">
           <select name="category">
-            ${state.menu.map((c, i) => `<option value="${i}">${c.name}</option>`).join('')}
+            ${state.menu.map((c) => `<option value="${c.id}">${c.name}</option>`).join('')}
           </select>
           <input name="name" required placeholder="Item name" />
           <input name="price" required type="number" placeholder="Price" />
@@ -472,7 +549,7 @@ const Editor = () => {
 }
 
 const QRCode = () => {
-  const url = `${location.origin}${location.pathname}#public`
+  const url = `${location.origin}${location.pathname}#public/${state.restaurant.slug || ''}`
   const img = `https://api.qrserver.com/v1/create-qr-code/?size=420x420&data=${encodeURIComponent(url)}`
   return `
     <div class="qr-layout">
@@ -521,14 +598,27 @@ const Settings = () => `
 `
 
 const PublicMenu = () => {
-  // Update scan count for demo
-  const updatedState = {
-    ...state,
-    scanCount: state.scanCount + 1,
-    today: state.today + 1,
+  if (publicData === null) {
+    return `
+      <main class="preview-page">
+        <section class="public-menu">
+          <p style="text-align:center;margin:60px;color:var(--muted)">Loading menu…</p>
+        </section>
+      </main>
+    `
   }
-  localStorage.setItem('menuquo-demo', JSON.stringify(updatedState))
-
+  if (publicData.notFound) {
+    return `
+      <main class="preview-page">
+        <section class="public-menu">
+          <p style="text-align:center;margin:60px;color:var(--muted)">
+            Menu not found. Scan the QR code again or ask the restaurant for their link.
+          </p>
+        </section>
+      </main>
+    `
+  }
+  const r = publicData.restaurant
   return `
     <main class="preview-page">
       <section class="public-menu">
@@ -536,22 +626,24 @@ const PublicMenu = () => {
           <a class="public-brand" href="#landing">
             <span class="brand-mark">m</span> menuquo
           </a>
-          <button class="btn ghost" data-go="dashboard/overview">Owner view</button>
+          <button class="btn ghost" data-go="${user ? 'dashboard/overview' : 'login'}">
+            ${user ? 'Owner view' : 'Own your menu'}
+          </button>
         </header>
         <section class="menu-hero">
           <img
-            src="${state.restaurant.hero || initial.restaurant.hero}"
+            src="${r.hero_image || 'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?auto=format&fit=crop&w=1200&q=85'}"
             alt=""
           />
           <div class="menu-hero-copy">
             <span>Welcome to</span>
-            <h1>${state.restaurant.name}</h1>
+            <h1>${r.name}</h1>
           </div>
         </section>
         <p class="menu-note">
           A little something for every appetite. Please ask our team about allergens and dietary requirements.
         </p>
-        ${state.menu.map(
+        ${publicData.menu.map(
           (c) => `
           <section class="public-section">
             <h2>${c.name}</h2>
@@ -560,19 +652,19 @@ const PublicMenu = () => {
             <article class="public-dish">
               <img
                 class="dish-image"
-                src="${i.image || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=200&q=70'}"
+                src="${i.image_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=200&q=70'}"
                 alt="${i.name}"
               />
               <div>
                 <b>${i.name}</b>
-                <small>${i.description}</small>
+                <small>${i.description || ''}</small>
                 ${i.tag ? `<span class="dish-tag">${i.tag}</span>` : ''}
                 ${!i.available ?
                   '<small style="color:var(--red);font-weight:700">Currently unavailable</small>'
                   : ''
                 }
               </div>
-              <b class="price">${money(i.price)}</b>
+              <b class="price">${r.currency}${Number(i.price).toLocaleString('en-IN')}</b>
             </article>`
             ).join('')}
           </section>`
@@ -585,29 +677,51 @@ const PublicMenu = () => {
   `
 }
 
-// Main App component - React component that manages routing via hash
+// Main App component - manages routing via hash and the Supabase session
 const App = () => {
-  // Initialize state from localStorage on mount
   useEffect(() => {
-    localStorage.setItem('menuquo-demo', JSON.stringify(state))
-  }, [])
-
-  // Watch for hash changes and update view state
-  useEffect(() => {
-    const handleHashChange = () => {
-      view = location.hash.slice(1) || 'landing'
+    const onHash = () => {
+      view = location.hash.slice(1) || (user ? 'dashboard/overview' : 'landing')
       render()
     }
 
-    // Initial setup
-    view = location.hash.slice(1) || 'landing'
-    render()
+    if (!supabaseReady) {
+      // No .env.local configured — run in demo mode (everything is local)
+      render()
+      return
+    }
 
-    // Listen for hash changes
-    window.addEventListener('hashchange', handleHashChange)
+    const boot = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      user = session?.user || null
+      if (user) await loadOwnerData()
+      view = location.hash.slice(1) || (user ? 'dashboard/overview' : 'landing')
+      render()
+      bootDone = true
+    }
+    boot()
 
-    // Cleanup
-    return () => window.removeEventListener('hashchange', handleHashChange)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_OUT') {
+        user = null
+        state = JSON.parse(JSON.stringify(EMPTY))
+        view = 'landing'
+        render()
+      } else if (event === 'SIGNED_IN' && session && !user) {
+        // Boot may have already loaded this session — don't load twice
+        if (!bootDone) return
+        user = session.user
+        loadOwnerData().then(() => render())
+      } else if (event === 'USER_UPDATED' && session) {
+        user = session.user
+      }
+    })
+
+    window.addEventListener('hashchange', onHash)
+    return () => {
+      subscription.unsubscribe()
+      window.removeEventListener('hashchange', onHash)
+    }
   }, [])
 
   return null // Rendering is handled via innerHTML in render()
